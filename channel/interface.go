@@ -3,8 +3,8 @@ package channel
 import "github.com/gwuhaolin/livego/av"
 
 type ChannelStream interface {
-	Align(timestamp int)
-	Read(timestamp int) (*chunk, error)
+	Align(timestamp uint32)
+	Read(timestamp uint32) (*chunk, error)
 }
 
 // This interface only needs av.ReadCloser because the Info() method

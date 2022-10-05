@@ -15,6 +15,7 @@ type packet struct {
 
 type chunk struct {
 	startTimestamp uint32
+	duration       uint32
 	startPacket    *packet
 	endPacket      *packet
 	next           *chunk
@@ -25,27 +26,29 @@ func (c *chunk) addPacket(p *av.Packet) {
 		p:    p,
 		next: nil,
 	}
+	duration := p.TimeStamp - c.startTimestamp
+	if duration > c.duration {
+		c.duration = duration
+	}
 	c.endPacket.next = cPacket
 	c.endPacket = cPacket
 }
 
-// cleanMetaData find metadata packets and replaces them with basic stream values
-func (c *chunk) cleanMetaData() {
-	return
+func (c *chunk) isFinal() bool {
+	return c.next == nil
 }
 
-// getDuration returns chunk time in milliseconds for advancing the timestamp clock
-func (c *chunk) getDuration() int {
-	return 0
-}
-
-func newChunk(p *av.Packet) *chunk {
+func newChunk(p *av.Packet, lastTimestamp uint32) *chunk {
 	cPacket := &packet{
 		p:    p,
 		next: nil,
 	}
+	timestamp := lastTimestamp
+	if timestamp == 0 {
+		timestamp = p.TimeStamp
+	}
 	return &chunk{
-		startTimestamp: p.TimeStamp,
+		startTimestamp: timestamp,
 		startPacket:    cPacket,
 		endPacket:      cPacket,
 	}
@@ -59,7 +62,7 @@ type chunkMaker struct {
 
 func (m *chunkMaker) addPacket(p *av.Packet) *chunk {
 	if m.currentChunk == nil {
-		m.currentChunk = newChunk(p)
+		m.currentChunk = newChunk(p, 0)
 		m.firstChunk = m.currentChunk
 		m.chunkCount = 1
 		return m.currentChunk
@@ -69,7 +72,7 @@ func (m *chunkMaker) addPacket(p *av.Packet) *chunk {
 	if p.IsVideo {
 		vh = p.Header.(av.VideoPacketHeader)
 		if vh.IsKeyFrame() && p.TimeStamp > m.currentChunk.startTimestamp {
-			nextChunk := newChunk(p)
+			nextChunk := newChunk(p, m.currentChunk.startTimestamp+m.currentChunk.duration)
 			m.currentChunk.next = nextChunk
 			m.currentChunk = nextChunk
 			m.chunkCount += 1

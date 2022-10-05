@@ -65,8 +65,8 @@ type ChannelState struct {
 	liveSources  ChannelSources
 	//slateSources StaticSources
 	staticAssets      staticAssets
-	timestamp         int
-	streamedTimestamp int
+	timestamp         uint32
+	streamedTimestamp uint32
 	beginCallback     BeginOutputCallback
 	outputReader      *outputReader
 }
@@ -193,7 +193,7 @@ func (c *ChannelState) timer() {
 		}
 		tick := <-ticker.C
 		runtime := tick.UnixMilli() - startTime
-		c.timestamp = int(runtime)
+		c.timestamp = uint32(runtime)
 		c.SendEvent(ChannelEvent{action: "tick"})
 	}
 }
@@ -234,12 +234,17 @@ func (c *ChannelState) main() {
 				// to getDuration. getDuration then will find the videoPacketHeader
 				// with the highest CompositionTime() and that will be used to get
 				// the delta for the duration of the currentChunk
-				c.streamedTimestamp += currentChunk.getDuration()
 
 				// add chunk.cleanMeta() method to find metadata packet and strip
 				// any values that only apply to files and not streams.
-				currentChunk.cleanMetaData()
-				c.outputReader.sendChunk(currentChunk, c.streamedTimestamp)
+				var chunkDuration uint32 = 0
+				c.streamedTimestamp, chunkDuration = c.outputReader.sendChunk(currentChunk, c.streamedTimestamp)
+				log.Infof("sendChunk: timestamp=%d, duration=%d", c.streamedTimestamp, chunkDuration)
+
+				if currentChunk.isFinal() {
+					log.Infof("current chunk was final. aligning stream at new timestamp: %d", c.streamedTimestamp)
+					source.Align(c.streamedTimestamp)
+				}
 				//log.Infof("read returned chunk: %w, error: %s", currentChunk, err)
 			}
 			// If we are here the clock sent a tick event and should have updated c.timestamp
@@ -305,13 +310,17 @@ func newOutputReader(app string, room string) *outputReader {
 
 // sendChunk cleans metadata and returns both the new timestamp and the chunk
 // duration.
-func (o *outputReader) sendChunk(c *chunk, streamTimestamp int) (uint32, uint32) {
+func (o *outputReader) sendChunk(c *chunk, streamTimestamp uint32) (uint32, uint32) {
 	p := c.startPacket
-	highestCompositionTime := c.startTimestamp
+	var duration uint32 = 0
 	for {
-		duration := highestCompositionTime - c.startTimestamp
 		if p == nil {
-			return highestCompositionTime, duration
+			return streamTimestamp + duration, duration
+		}
+
+		offset := p.p.TimeStamp - c.startTimestamp
+		if offset > duration {
+			duration = offset
 		}
 		// As we send the chunk we need to detect and rewrite metadata packets
 		// so they contain correct stream values instead of file values
@@ -319,7 +328,18 @@ func (o *outputReader) sendChunk(c *chunk, streamTimestamp int) (uint32, uint32)
 
 		// check video metadata and update highestCompositionTime using
 		// VideoPacketHeader.CompositionTime() cast to uint32
-		o.queue <- p.p
+		packetCopy := &av.Packet{}
+		// Double copying isn't great, but we don't want to modify the timestamp
+		// ini the original source. It would break static slate assets in memory.
+		dupePacket(*p.p, packetCopy, streamTimestamp+offset)
+		if packetCopy.IsMetadata {
+			videoHdr, ok := packetCopy.Header.(av.VideoPacketHeader)
+			if ok {
+				ct := videoHdr.CompositionTime()
+				log.Infof("got header with composition time: %d", ct)
+			}
+		}
+		o.queue <- packetCopy
 		next := p.next
 		p = next
 	}
@@ -327,13 +347,7 @@ func (o *outputReader) sendChunk(c *chunk, streamTimestamp int) (uint32, uint32)
 
 func (o *outputReader) Read(p *av.Packet) error {
 	packetOut := <-o.queue
-	p.IsVideo = packetOut.IsVideo
-	p.IsAudio = packetOut.IsAudio
-	p.IsMetadata = packetOut.IsMetadata
-	p.StreamID = packetOut.StreamID
-	p.TimeStamp = packetOut.TimeStamp
-	p.Header = packetOut.Header
-	p.Data = packetOut.Data
+	dupePacket(*packetOut, p, 0)
 	return nil
 }
 
@@ -348,4 +362,17 @@ func (o *outputReader) Info() av.Info {
 func (o *outputReader) Close(err error) {
 	o.closeError = err
 	o.closed = true
+}
+
+func dupePacket(in av.Packet, out *av.Packet, timeStamp uint32) {
+	out.IsVideo = in.IsVideo
+	out.IsAudio = in.IsAudio
+	out.IsMetadata = in.IsMetadata
+	out.StreamID = in.StreamID
+	out.TimeStamp = in.TimeStamp
+	out.Header = in.Header
+	out.Data = in.Data
+	if timeStamp > 0 {
+		out.TimeStamp = timeStamp
+	}
 }

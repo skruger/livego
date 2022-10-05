@@ -15,7 +15,7 @@ type staticAsset struct {
 	firstChunk      *chunk
 	currentChunk    *chunk
 	startTimestamp  uint32
-	streamTimestamp int
+	streamTimestamp uint32
 }
 
 func newStaticAsset(config configure.SlateConfig) (*staticAsset, error) {
@@ -57,12 +57,12 @@ func newStaticAsset(config configure.SlateConfig) (*staticAsset, error) {
 	return sa, nil
 }
 
-func (s *staticAsset) Align(timestamp int) {
+func (s *staticAsset) Align(timestamp uint32) {
 	s.streamTimestamp = timestamp
 	s.startTimestamp = s.firstChunk.startTimestamp
 }
 
-func (s *staticAsset) Read(timestamp int) (*chunk, error) {
+func (s *staticAsset) Read(timestamp uint32) (*chunk, error) {
 	if s.currentChunk == nil {
 		s.currentChunk = s.firstChunk
 	}
