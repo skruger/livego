@@ -3,6 +3,7 @@ package configure
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/kr/pretty"
@@ -24,6 +25,32 @@ import (
 }
 */
 
+type ChannelRtmpSource struct {
+	Name string `mapstructure:"name"`
+	App  string `mapstructure:"appname"`
+	Room string `mapstructure:"room"`
+}
+
+type ChannelRtmpSources []ChannelRtmpSource
+
+type SlateConfig struct {
+	Name     string `mapstructure:"name"`
+	Filename string `mapstructure:"filename"`
+}
+
+type SlateConfigs []SlateConfig
+
+type Channel struct {
+	Name          string             `mapstructure:"name"`
+	App           string             `mapstructure:"appname"`
+	RtmpSources   ChannelRtmpSources `mapstructure:"static_rtmp_sources"`
+	PrerollSlate  string             `mapstructure:"pre_slate_name"`
+	MissingSlate  string             `mapstructure:"missing_slate_name"`
+	StaticSources SlateConfigs       `mapstructure:"static_sources"`
+}
+
+type Channels []Channel
+
 type Application struct {
 	Appname    string   `mapstructure:"appname"`
 	Live       bool     `mapstructure:"live"`
@@ -31,6 +58,7 @@ type Application struct {
 	Flv        bool     `mapstructure:"flv"`
 	Api        bool     `mapstructure:"api"`
 	StaticPush []string `mapstructure:"static_push"`
+	RtmpAddr   string   `mapstructure:"override_rtmp_addr"`
 }
 
 type Applications []Application
@@ -58,6 +86,7 @@ type ServerCfg struct {
 	GopNum          int          `mapstructure:"gop_num"`
 	JWT             JWT          `mapstructure:"jwt"`
 	Server          Applications `mapstructure:"server"`
+	Channel         Channels     `mapstructure:"channel"`
 }
 
 // default config
@@ -168,6 +197,17 @@ func CheckAppName(appname string) bool {
 		}
 	}
 	return false
+}
+
+func GetChannelCfg(chanName string) (*Channel, error) {
+	channels := Channels{}
+	Config.UnmarshalKey("channel", &channels)
+	for _, channel := range channels {
+		if channel.Name == chanName {
+			return &channel, nil
+		}
+	}
+	return nil, fmt.Errorf("channel not found: %s", chanName)
 }
 
 func GetStaticPushUrlList(appname string) ([]string, bool) {

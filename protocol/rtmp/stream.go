@@ -2,6 +2,7 @@ package rtmp
 
 import (
 	"fmt"
+	"github.com/gwuhaolin/livego/channel"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +33,7 @@ func NewRtmpStream() *RtmpStream {
 func (rs *RtmpStream) HandleReader(r av.ReadCloser) {
 	info := r.Info()
 	log.Debugf("HandleReader: info[%v]", info)
-
+	// info.Key = "<app>/<room>"
 	var stream *Stream
 	i, ok := rs.streams.Load(info.Key)
 	if stream, ok = i.(*Stream); ok {
@@ -148,8 +149,23 @@ func (s *Stream) AddWriter(w av.WriteCloser) {
 	s.ws.Store(info.UID, pw)
 }
 
-/*检测本application下是否配置static_push,
-如果配置, 启动push远端的连接*/
+func (s *Stream) ConnectChannels() {
+	key := s.info.Key
+	writers, err := channel.GetChannelSourceWriteClosers(key)
+	if err != nil {
+		log.Error("error getting channel source list:", err)
+		return
+	}
+	for _, wc := range writers {
+		log.Info("add writer: ", wc)
+		s.AddWriter(*wc)
+	}
+}
+
+/*
+检测本application下是否配置static_push,
+如果配置, 启动push远端的连接
+*/
 func (s *Stream) StartStaticPush() {
 	key := s.info.Key
 
@@ -306,6 +322,10 @@ func (s *Stream) SendStaticPush(packet av.Packet) {
 	}
 }
 
+// TransStart begins when a publisher stream connects and runs indefinitely
+// It reads until there is a read error and it copies each read packet to
+// all of the writestreams of type PackWriterCloser in the map Stream.ws.
+// This is the core where inputs are connected to outputs.
 func (s *Stream) TransStart() {
 	s.isStart = true
 	var p av.Packet
@@ -313,6 +333,7 @@ func (s *Stream) TransStart() {
 	log.Debugf("TransStart: %v", s.info)
 
 	s.StartStaticPush()
+	s.ConnectChannels()
 
 	for {
 		if !s.isStart {

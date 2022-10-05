@@ -72,6 +72,8 @@ func NewFLVWriter(app, title, url string, ctx *os.File) *FLVWriter {
 	}
 
 	ret.ctx.Write(flvHeader)
+
+	// Write first size of previous packet (null)
 	pio.PutI32BE(ret.buf[:4], 0)
 	ret.ctx.Write(ret.buf[:4])
 

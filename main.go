@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"github.com/gwuhaolin/livego/av"
+	"github.com/gwuhaolin/livego/channel"
 	"net"
 	"path"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/gwuhaolin/livego/configure"
@@ -38,8 +41,11 @@ func startHls() *hls.Server {
 	return hlsServer
 }
 
-func startRtmp(stream *rtmp.RtmpStream, hlsServer *hls.Server) {
+func startRtmp(stream *rtmp.RtmpStream, hlsServer *hls.Server, app configure.Application) {
 	rtmpAddr := configure.Config.GetString("rtmp_addr")
+	if app.RtmpAddr != "" {
+		rtmpAddr = app.RtmpAddr
+	}
 
 	rtmpListen, err := net.Listen("tcp", rtmpAddr)
 	if err != nil {
@@ -65,7 +71,7 @@ func startRtmp(stream *rtmp.RtmpStream, hlsServer *hls.Server) {
 	rtmpServer.Serve(rtmpListen)
 }
 
-func startHTTPFlv(stream *rtmp.RtmpStream) {
+func startHTTPFlv(stream *rtmp.RtmpStream) *httpflv.Server {
 	httpflvAddr := configure.Config.GetString("httpflv_addr")
 
 	flvListen, err := net.Listen("tcp", httpflvAddr)
@@ -83,9 +89,10 @@ func startHTTPFlv(stream *rtmp.RtmpStream) {
 		log.Info("HTTP-FLV listen On ", httpflvAddr)
 		hdlServer.Serve(flvListen)
 	}()
+	return hdlServer
 }
 
-func startAPI(stream *rtmp.RtmpStream) {
+func startAPI(stream *rtmp.RtmpStream) *api.Server {
 	apiAddr := configure.Config.GetString("api_addr")
 	rtmpAddr := configure.Config.GetString("rtmp_addr")
 
@@ -104,7 +111,9 @@ func startAPI(stream *rtmp.RtmpStream) {
 			log.Info("HTTP-API listen On ", apiAddr)
 			opServer.Serve(opListen)
 		}()
+		return opServer
 	}
+	return nil
 }
 
 func init() {
@@ -134,21 +143,60 @@ func main() {
         version: %s
 	`, VERSION)
 
+	channels := configure.Channels{}
+	configure.Config.UnmarshalKey("channel", &channels)
+	for _, chanCfg := range channels {
+		log.Info("Start channel:", chanCfg.Name)
+		_, err := channel.StartChannel(chanCfg.App, chanCfg.Name)
+		if err != nil {
+			log.Fatalf("unable to start channel '%s': %s", chanCfg.Name, err)
+		}
+	}
+
 	apps := configure.Applications{}
 	configure.Config.UnmarshalKey("server", &apps)
-	for _, app := range apps {
+	var hlsServer *hls.Server
+	var wg sync.WaitGroup
+	for num, app := range apps {
 		stream := rtmp.NewRtmpStream()
-		var hlsServer *hls.Server
-		if app.Hls {
-			hlsServer = startHls()
-		}
-		if app.Flv {
-			startHTTPFlv(stream)
-		}
-		if app.Api {
-			startAPI(stream)
-		}
+		if num == 0 {
+			if app.Hls {
+				hlsServer = startHls()
+			}
+			if app.Flv {
+				startHTTPFlv(stream)
+			}
+			if app.Api {
+				startAPI(stream)
+			}
 
-		startRtmp(stream, hlsServer)
+			// Register channel.BeginOutputCallback() function to be implemented in
+			// rtmpServer with the channel so that when the channel is ready it can
+			// start sending packets to the rtmpServer named input. The begin output
+			// callback function will act similar to Server.handleConn and pass
+			// the received ReadCloser to s.handler.HandleReader(reader)
+			// It may be good to identify a rtmp.Stream as an output only stream so we
+			// don't call s.ConnectChannels() again and risk a feedback loop
+
+			callback := func(r av.ReadCloser) error {
+				stream.HandleReader(r)
+				return nil
+			}
+			channel.SetBeginOutputCallbacks(callback)
+
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+				startRtmp(stream, hlsServer, app)
+			}()
+		} else {
+			log.Warningf("starting more than one app is not supported, skipping '%s'", app.Appname)
+		}
 	}
+	channel.SetServerReady(true)
+	wg.Wait()
+	// TODO: pass a cancel context to startRtmp and anything
+	// else that is started then catch SIGTERM and activate the
+	// cancel context to signal a graceful shutdown.
 }

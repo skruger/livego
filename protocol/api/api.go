@@ -123,6 +123,9 @@ func (s *Server) Serve(l net.Listener) error {
 	mux.HandleFunc("/stat/livestat", func(w http.ResponseWriter, r *http.Request) {
 		s.GetLiveStatics(w, r)
 	})
+	//mux.HandleFunc("/control/channel", func(w http.ResponseWriter, r *http.Request) {
+	//	s.handleChannel(w, r)
+	//})
 	http.Serve(l, JWTMiddleware(mux))
 	return nil
 }
@@ -142,7 +145,7 @@ type streams struct {
 	Players    []stream `json:"players"`
 }
 
-//http://127.0.0.1:8090/stat/livestat
+// http://127.0.0.1:8090/stat/livestat
 func (server *Server) GetLiveStatics(w http.ResponseWriter, req *http.Request) {
 	res := &Response{
 		w:      w,
@@ -242,7 +245,7 @@ func (server *Server) GetLiveStatics(w http.ResponseWriter, req *http.Request) {
 	res.Data = msgs
 }
 
-//http://127.0.0.1:8090/control/pull?&oper=start&app=live&name=123456&url=rtmp://192.168.16.136/live/123456
+// http://127.0.0.1:8090/control/pull?&oper=start&app=live&name=123456&url=rtmp://192.168.16.136/live/123456
 func (s *Server) handlePull(w http.ResponseWriter, req *http.Request) {
 	var retString string
 	var err error
@@ -311,7 +314,7 @@ func (s *Server) handlePull(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-//http://127.0.0.1:8090/control/push?&oper=start&app=live&name=123456&url=rtmp://192.168.16.136/live/123456
+// http://127.0.0.1:8090/control/push?&oper=start&app=live&name=123456&url=rtmp://192.168.16.136/live/123456
 func (s *Server) handlePush(w http.ResponseWriter, req *http.Request) {
 	var retString string
 	var err error
@@ -374,7 +377,7 @@ func (s *Server) handlePush(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-//http://127.0.0.1:8090/control/reset?room=ROOM_NAME
+// http://127.0.0.1:8090/control/reset?room=ROOM_NAME
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	res := &Response{
 		w:      w,
@@ -406,7 +409,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	res.Data = msg
 }
 
-//http://127.0.0.1:8090/control/get?room=ROOM_NAME
+// http://127.0.0.1:8090/control/get?room=ROOM_NAME
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	res := &Response{
 		w:      w,
@@ -437,7 +440,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	res.Data = msg
 }
 
-//http://127.0.0.1:8090/control/delete?room=ROOM_NAME
+// http://127.0.0.1:8090/control/delete?room=ROOM_NAME
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	res := &Response{
 		w:      w,
@@ -467,3 +470,35 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	res.Status = 404
 	res.Data = "room not found"
 }
+
+//// http://127.0.0.1:8090/control/channel?
+//func (s *Server) handleChannel(w http.ResponseWriter, req *http.Request) {
+//	res := &Response{
+//		w:      w,
+//		Data:   nil,
+//		Status: 200,
+//	}
+//	defer res.SendJson()
+//
+//	if req.ParseForm() != nil {
+//		res.Status = 400
+//		res.Data = "url: /control/pull?&oper=start&app=live&name=123456&url=rtmp://192.168.16.136/live/123456"
+//		return
+//	}
+//
+//	oper := req.Form.Get("oper")
+//	//app := req.Form.Get("app")
+//	name := req.Form.Get("name")
+//	//url := req.Form.Get("url")
+//
+//	if oper == "start" {
+//		chanState, err := channel.StartChannel(name)
+//		if err != nil {
+//			log.Error("start channel error: %s", err)
+//			res.Status = 400
+//			res.Data = "Error starting channel"
+//			return
+//		}
+//		log.Debugf("Channel state: %s", chanState)
+//	}
+//}
