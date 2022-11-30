@@ -3,6 +3,7 @@ package channel
 import (
 	"fmt"
 	"github.com/gwuhaolin/livego/av"
+	"sync"
 )
 
 // Packet and chunk linked lists are for holding stream information
@@ -13,12 +14,16 @@ type packet struct {
 	next *packet
 }
 
+type foundMetadataCallback func(p *av.Packet)
+
 type chunk struct {
-	startTimestamp uint32
-	duration       uint32
-	startPacket    *packet
-	endPacket      *packet
-	next           *chunk
+	startTimestamp    uint32
+	duration          uint32
+	relativeTimestamp uint32
+	startPacket       *packet
+	endPacket         *packet
+	next              *chunk
+	sourceTag         string
 }
 
 func (c *chunk) addPacket(p *av.Packet) {
@@ -38,7 +43,24 @@ func (c *chunk) isFinal() bool {
 	return c.next == nil
 }
 
-func newChunk(p *av.Packet, lastTimestamp uint32) *chunk {
+func (c *chunk) resetTimestamp(newTimestamp uint32) uint32 {
+	baseTimestamp := c.startTimestamp
+	start := newTimestamp
+	c.startTimestamp = start
+	p := c.startPacket
+	var offset uint32 = 0
+	for {
+		if p == nil {
+			break
+		}
+		offset = p.p.TimeStamp - baseTimestamp
+		p.p.TimeStamp = start + offset
+		p = p.next
+	}
+	return offset
+}
+
+func newChunk(p *av.Packet, lastTimestamp uint32, sourceTag string) *chunk {
 	cPacket := &packet{
 		p:    p,
 		next: nil,
@@ -51,6 +73,7 @@ func newChunk(p *av.Packet, lastTimestamp uint32) *chunk {
 		startTimestamp: timestamp,
 		startPacket:    cPacket,
 		endPacket:      cPacket,
+		sourceTag:      sourceTag,
 	}
 }
 
@@ -58,11 +81,27 @@ type chunkMaker struct {
 	currentChunk *chunk
 	firstChunk   *chunk
 	chunkCount   int
+	lock         sync.Mutex
+	metadataCb   foundMetadataCallback
+	sourceTag    string
+}
+
+func (m *chunkMaker) setMetadataCallback(cb foundMetadataCallback) {
+	m.metadataCb = cb
 }
 
 func (m *chunkMaker) addPacket(p *av.Packet) *chunk {
+	if p.IsMetadata {
+		if m.metadataCb != nil {
+			m.metadataCb(p)
+		}
+	}
+	defer func() {
+		m.lock.Unlock()
+	}()
+	m.lock.Lock()
 	if m.currentChunk == nil {
-		m.currentChunk = newChunk(p, 0)
+		m.currentChunk = newChunk(p, 0, m.sourceTag)
 		m.firstChunk = m.currentChunk
 		m.chunkCount = 1
 		return m.currentChunk
@@ -72,7 +111,7 @@ func (m *chunkMaker) addPacket(p *av.Packet) *chunk {
 	if p.IsVideo {
 		vh = p.Header.(av.VideoPacketHeader)
 		if vh.IsKeyFrame() && p.TimeStamp > m.currentChunk.startTimestamp {
-			nextChunk := newChunk(p, m.currentChunk.startTimestamp+m.currentChunk.duration)
+			nextChunk := newChunk(p, m.currentChunk.startTimestamp+m.currentChunk.duration, m.sourceTag)
 			m.currentChunk.next = nextChunk
 			m.currentChunk = nextChunk
 			m.chunkCount += 1
@@ -98,6 +137,23 @@ func (m *chunkMaker) loadSlate(closer av.ReadCloser) (int, error) {
 		packetCount += 1
 	}
 	return packetCount, nil
+}
+
+func (m *chunkMaker) pollFinishedChunk() *chunk {
+	defer func() {
+		m.lock.Unlock()
+	}()
+	m.lock.Lock()
+
+	if m.firstChunk == nil || m.currentChunk == nil {
+		return nil
+	}
+	if m.firstChunk != m.currentChunk {
+		rChunk := m.firstChunk
+		m.firstChunk = rChunk.next
+		return rChunk
+	}
+	return nil
 }
 
 type chunkPlayer struct {

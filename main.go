@@ -7,6 +7,7 @@ import (
 	"net"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -129,7 +130,9 @@ func init() {
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
+
 			log.Error("livego panic: ", r)
+			log.Info(string(debug.Stack()))
 			time.Sleep(1 * time.Second)
 		}
 	}()

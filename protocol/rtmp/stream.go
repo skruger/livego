@@ -158,7 +158,7 @@ func (s *Stream) ConnectChannels() {
 	}
 	for _, wc := range writers {
 		log.Info("add writer: ", wc)
-		s.AddWriter(*wc)
+		s.AddWriter(wc)
 	}
 }
 

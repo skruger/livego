@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"fmt"
+	"github.com/gwuhaolin/livego/av"
 	"github.com/gwuhaolin/livego/configure"
 	"github.com/gwuhaolin/livego/container/flv"
 	log "github.com/sirupsen/logrus"
@@ -16,6 +18,7 @@ type staticAsset struct {
 	currentChunk    *chunk
 	startTimestamp  uint32
 	streamTimestamp uint32
+	metadataPacket  *av.Packet
 }
 
 func newStaticAsset(config configure.SlateConfig) (*staticAsset, error) {
@@ -36,7 +39,14 @@ func newStaticAsset(config configure.SlateConfig) (*staticAsset, error) {
 		return nil, err
 	}
 
-	loader := &chunkMaker{}
+	var recentMetadataPacket *av.Packet
+
+	loader := &chunkMaker{
+		metadataCb: func(p *av.Packet) {
+			recentMetadataPacket = p
+		},
+		sourceTag: fmt.Sprintf("slate/%s", config.Name),
+	}
 	packetCount, err := loader.loadSlate(flvReader)
 	if err != nil {
 		log.Warning("loadSlate encountered an error: ", err)
@@ -49,9 +59,10 @@ func newStaticAsset(config configure.SlateConfig) (*staticAsset, error) {
 
 	log.Infof("Loaded slate '%s' from %s in %d chunks (%d packets)", config.Name, config.Filename, loader.chunkCount, packetCount)
 	sa := &staticAsset{
-		Name:       config.Name,
-		Filename:   config.Filename,
-		firstChunk: loader.firstChunk,
+		Name:           config.Name,
+		Filename:       config.Filename,
+		firstChunk:     loader.firstChunk,
+		metadataPacket: recentMetadataPacket,
 	}
 
 	return sa, nil
@@ -85,4 +96,48 @@ func (s *staticAssets) findByName(name string) *staticAsset {
 		}
 	}
 	return nil
+}
+
+type slateProvider struct {
+	staticAssets staticAssets
+	currentSlate *staticAsset
+}
+
+func newSlateProvider() *slateProvider {
+	return &slateProvider{}
+}
+
+func (s *slateProvider) addSlate(asset *staticAsset) {
+	s.staticAssets = append(s.staticAssets, asset)
+	if s.currentSlate == nil {
+		s.currentSlate = asset
+	}
+}
+
+func (s *slateProvider) setSlate(name string) error {
+	slate := s.staticAssets.findByName(name)
+	if slate != nil {
+		s.currentSlate = slate
+		return nil
+	}
+	return fmt.Errorf("slate not found: %s", name)
+}
+
+func (s *slateProvider) isFinal() bool {
+	if s.currentSlate == nil || s.currentSlate.currentChunk == nil {
+		return false
+	}
+	return s.currentSlate.currentChunk.isFinal()
+}
+
+func (s *slateProvider) resetAsset(ts uint32) {
+	if s.currentSlate == nil {
+		return
+	}
+	s.currentSlate.currentChunk = s.currentSlate.firstChunk
+	s.currentSlate.Align(ts)
+}
+
+func (s *slateProvider) getChunk(ts uint32) (*chunk, error) {
+	return s.currentSlate.Read(ts)
 }

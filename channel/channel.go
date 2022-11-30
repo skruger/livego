@@ -2,17 +2,23 @@ package channel
 
 import (
 	"fmt"
-	"github.com/gwuhaolin/livego/av"
-	"github.com/gwuhaolin/livego/configure"
-	log "github.com/sirupsen/logrus"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/gwuhaolin/livego/av"
+	"github.com/gwuhaolin/livego/configure"
 )
 
 const (
-	stream_preroll = iota
-	stream_live    = iota
-	stream_end     = iota
+	source_none   = iota
+	source_slate  = iota
+	source_stream = iota
+
+	slate_preroll = iota
+	slate_live    = iota
+	slate_end     = iota
 )
 
 type ChannelEvent struct {
@@ -21,7 +27,7 @@ type ChannelEvent struct {
 
 type ChannelSource struct {
 	name     string
-	receiver *av.WriteCloser
+	receiver *streamSource
 	appname  string
 	room     string
 	cs       *ChannelStream
@@ -56,19 +62,27 @@ func (s *StaticSources) findByName(name string) *StaticSource {
 }
 
 type ChannelState struct {
-	name         string
-	appName      string
-	config       *configure.Channel
-	ch           chan ChannelEvent
-	stream_state int
-	stopping     bool
-	liveSources  ChannelSources
+	name    string
+	appName string
+	config  *configure.Channel
+	wg      sync.WaitGroup
+
+	stream_state      int
+	streamClock       chan uint32 // server time source (100ms ticks)
+	timestamp         uint32      // server time, updated when streamClock tick is sent
+	streamedTimestamp uint32      // end time of all played chunks
+	slateFillTimeout  uint32      // default 500ms past streamedTimestamp fill with slate
+	playoutOffset     uint32      // default 1000ms
+	// if timestamp > streamedTimestamp + slateFillTimeout transition to slate state
+	// if any stream chunks are available transition to stream state
+
+	ch       chan ChannelEvent
+	stopping bool
+	switcher *delaySwitcher
+	slate    *slateProvider
 	//slateSources StaticSources
-	staticAssets      staticAssets
-	timestamp         uint32
-	streamedTimestamp uint32
-	beginCallback     BeginOutputCallback
-	outputReader      *outputReader
+	beginCallback BeginOutputCallback
+	outputReader  *outputReader
 }
 
 var channels = &sync.Map{}
@@ -99,12 +113,12 @@ func waitServerReady() {
 	}
 }
 
-func GetChannelSourceWriteClosers(streamKey string) ([]*av.WriteCloser, error) {
-	var closers []*av.WriteCloser
+func GetChannelSourceWriteClosers(streamKey string) ([]av.WriteCloser, error) {
+	var closers []av.WriteCloser
 	var err error
 	channels.Range(func(key interface{}, val interface{}) bool {
 		if channel, ok := val.(*ChannelState); ok {
-			for _, chanSource := range channel.liveSources {
+			for _, chanSource := range channel.switcher.sources {
 				sourceKey := fmt.Sprintf("%s/%s", chanSource.appname, chanSource.room)
 				if sourceKey == streamKey {
 					closers = append(closers, chanSource.receiver)
@@ -138,22 +152,29 @@ func StartChannel(appName string, name string) (*ChannelState, error) {
 	}
 
 	newChannel := &ChannelState{
-		name:         name,
-		appName:      appName,
-		config:       chanCfg,
-		ch:           make(chan ChannelEvent, 100),
-		stream_state: stream_preroll,
+		name:             name,
+		appName:          appName,
+		config:           chanCfg,
+		wg:               sync.WaitGroup{},
+		ch:               make(chan ChannelEvent, 100),
+		streamClock:      make(chan uint32, 10),
+		stream_state:     source_none,
+		slateFillTimeout: 500,
+		playoutOffset:    1000,
+		switcher:         newDelaySwitcher(7000),
+		slate:            newSlateProvider(),
+		stopping:         false,
 	}
 	for _, rtmpSource := range chanCfg.RtmpSources {
-		writeCloser := NewStreamSource()
+		writeCloser := newStreamSource(fmt.Sprintf("stream/%s", rtmpSource.Name))
 		cs := ChannelSource{
 			name:     rtmpSource.Name,
-			receiver: &writeCloser,
+			receiver: writeCloser,
 			appname:  rtmpSource.App,
 			room:     rtmpSource.Room,
 		}
 		log.Infof("bound channel source for %s/%s to %s/%s", name, rtmpSource.Name, rtmpSource.App, rtmpSource.Room)
-		newChannel.liveSources = append(newChannel.liveSources, cs)
+		newChannel.switcher.addSource(cs)
 	}
 
 	for _, fileSource := range chanCfg.StaticSources {
@@ -161,11 +182,25 @@ func StartChannel(appName string, name string) (*ChannelState, error) {
 		if err != nil {
 			return nil, err
 		}
-		newChannel.staticAssets = append(newChannel.staticAssets, asset)
+		newChannel.slate.addSlate(asset)
+	}
+	if len(newChannel.slate.staticAssets) == 0 {
+		return nil, fmt.Errorf("channel '%s' can not start without any slate assets", newChannel.name)
 	}
 
+	slateErr := newChannel.slate.setSlate(chanCfg.PrerollSlate)
+	log.Errorf("using '%s' instead of configured preroll slate: %s", newChannel.slate.currentSlate.Name, slateErr)
+
 	channels.Store(name, newChannel)
-	go newChannel.main()
+	go func() {
+		newChannel.wg.Add(1)
+		defer func() {
+			newChannel.wg.Done()
+			newChannel.stopping = true
+		}()
+		newChannel.main()
+	}()
+
 	return newChannel, nil
 }
 
@@ -186,7 +221,7 @@ func (c *ChannelState) SendEvent(event ChannelEvent) {
 
 func (c *ChannelState) timer() {
 	startTime := time.Now().UnixMilli()
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(400 * time.Millisecond)
 	for {
 		if c.stopping {
 			break
@@ -194,7 +229,7 @@ func (c *ChannelState) timer() {
 		tick := <-ticker.C
 		runtime := tick.UnixMilli() - startTime
 		c.timestamp = uint32(runtime)
-		c.SendEvent(ChannelEvent{action: "tick"})
+		c.streamClock <- c.timestamp
 	}
 }
 
@@ -202,54 +237,114 @@ func (c *ChannelState) main() {
 	waitServerReady()
 	c.outputReader = newOutputReader(c.appName, c.name)
 	c.beginCallback(c.outputReader)
-	oldSource := ""
+	//oldSource := ""
 	go c.timer()
+	go c.outputReader.start()
 	c.streamedTimestamp = 0
 	for {
 		// Receive on event channel
-		ev := <-c.ch
-		switch ev.action {
-		case "stop":
-			log.Info("channel %s stopping", c.name)
-			c.stopping = true
+		select {
+		case tick := <-c.streamClock:
+			c.switcher.updateTime(c.streamedTimestamp)
+			if c.timestamp > c.streamedTimestamp {
+				// look for next chunk
+				//log.Infof("timestamp=%d, tick=%d, streamedTs=%d, slateTimeout=%d", c.timestamp, tick, c.streamedTimestamp, c.slateFillTimeout)
+				if c.timestamp > c.streamedTimestamp+c.slateFillTimeout {
+					c.handleSlate(tick)
+				} else {
+					c.handleStream(tick)
+				}
+			}
+		case ev := <-c.ch:
+
+			switch ev.action {
+			case "stop":
+				log.Info("channel %s stopping", c.name)
+				c.stopping = true
+				break
+			default:
+				log.Warning("unrecognized channel event action '%s' on channel %s", ev.action, c.name)
+			}
+
+		}
+	}
+}
+
+func (c *ChannelState) addChunk(segment *chunk, meta *av.Packet) {
+	if meta != nil {
+		c.outputReader.sendPacket(meta, c.streamedTimestamp)
+	}
+
+	segment.resetTimestamp(c.streamedTimestamp)
+
+	chunkPackets := 0
+	next := segment.startPacket
+	minTs := next.p.TimeStamp
+	maxTs := next.p.TimeStamp
+	for {
+		if next == nil {
 			break
-		case "tick":
-			name, source := c.selectSource()
-			if name != oldSource {
-				oldSource = name
-				log.Infof("channel %s, tick %d, switched to source %s", c.name, c.timestamp, name)
-				// When selecting a new source an onMetaData packet needs to be sent according
-				// to the onMetaData section starting on page 14 of Video File Format Spec v10
-				// perhaps send it every chunk (each 'I' and following 'P' frames)
-			}
-			for {
-				currentChunk, err := source.Read(c.timestamp)
-				if err != nil {
-					log.Errorf("error reading chunk from source: %s", err)
-				}
-				if currentChunk == nil {
-					break
-				}
-				// source needs to be able to return a start time that can be passed
-				// to getDuration. getDuration then will find the videoPacketHeader
-				// with the highest CompositionTime() and that will be used to get
-				// the delta for the duration of the currentChunk
+		}
+		if minTs > next.p.TimeStamp {
+			minTs = next.p.TimeStamp
+		}
+		if maxTs < next.p.TimeStamp {
+			maxTs = next.p.TimeStamp
+		}
+		next = next.next
+		chunkPackets += 1
+	}
 
-				// add chunk.cleanMeta() method to find metadata packet and strip
-				// any values that only apply to files and not streams.
-				var chunkDuration uint32 = 0
-				c.streamedTimestamp, chunkDuration = c.outputReader.sendChunk(currentChunk, c.streamedTimestamp)
-				log.Infof("sendChunk: timestamp=%d, duration=%d", c.streamedTimestamp, chunkDuration)
+	var chunkDuration uint32 = 0
+	c.streamedTimestamp, chunkDuration = c.outputReader.sendChunk(segment, c.streamedTimestamp)
+	log.Infof("sendChunk %s: timestamp=%d, duration=%d, packets=%d, min/max=%d/%d", segment.sourceTag, c.streamedTimestamp, chunkDuration, chunkPackets, minTs, maxTs)
 
-				if currentChunk.isFinal() {
-					log.Infof("current chunk was final. aligning stream at new timestamp: %d", c.streamedTimestamp)
-					source.Align(c.streamedTimestamp)
-				}
-				//log.Infof("read returned chunk: %w, error: %s", currentChunk, err)
-			}
-			// If we are here the clock sent a tick event and should have updated c.timestamp
-		default:
-			log.Warning("unrecognized channel event action '%s' on channel %s", ev.action, c.name)
+}
+
+func (c *ChannelState) handleSlate(ts uint32) {
+	stateChange := false
+	if c.stream_state != source_slate {
+		c.stream_state = source_slate
+		c.slate.resetAsset(c.streamedTimestamp)
+		stateChange = true
+		log.Infof("handleSlate: stateChange=%t, ts=%d", stateChange, ts)
+	}
+	chk, err := c.slate.getChunk(ts)
+	if err != nil {
+		log.Errorf("unable to read slate chunk: %s", err)
+	}
+	if chk != nil {
+		if stateChange {
+			c.addChunk(chk, c.slate.currentSlate.metadataPacket)
+		} else {
+			c.addChunk(chk, nil)
+
+		}
+	}
+	if c.slate.isFinal() {
+		log.Infof("current chunk was final. aligning slate at new timestamp: %d", c.streamedTimestamp)
+		c.slate.resetAsset(c.streamedTimestamp)
+	}
+}
+
+func (c *ChannelState) handleStream(ts uint32) {
+	chk, err := c.switcher.Read(c.streamedTimestamp)
+	if err != nil {
+		log.Errorf("switcher error: %s", err)
+	}
+	if chk != nil {
+		stateChange := false
+		if c.stream_state != source_stream {
+			c.stream_state = source_stream
+			stateChange = true
+		}
+		log.Infof("handleStream: stateChange=%t, ts=%d", stateChange, ts)
+
+		//chk.resetTimestamp(c.streamedTimestamp)
+		if stateChange {
+			c.addChunk(chk, nil)
+		} else {
+			c.addChunk(chk, nil)
 		}
 	}
 }
@@ -271,13 +366,16 @@ func (c *ChannelState) main() {
 // rtmp steam source. At each tick it will return the appropriate
 // ChannelStream whose internal state is unchanged and can be .Read()
 // until nothing else is returned for the current timestamp.
-func (c *ChannelState) selectSource() (string, ChannelStream) {
-	if c.stream_state == stream_preroll {
-		slateSource := c.staticAssets.findByName(c.config.PrerollSlate)
-		return slateSource.Name, slateSource
-	}
-	return "", nil
-}
+//func (c *ChannelState) selectSource() (string, *av.Packet, ChannelStream) {
+//	if c.switcher.isReady() {
+//		return "stream", c.switcher
+//	}
+//	if c.stream_state == stream_preroll {
+//		slateSource := c.staticAssets.findByName(c.config.PrerollSlate)
+//		return slateSource.Name, slateSource.metadataPacket, slateSource
+//	}
+//	return "", nil, nil
+//}
 
 // Generate time events for stream transit
 // Work in chunk units
@@ -285,94 +383,3 @@ func (c *ChannelState) selectSource() (string, ChannelStream) {
 // When read returns nil chunk we continue and wait for the next time event
 // Add a timer main loop that generates an event with action=tick while
 // updating c.timestamp
-
-// outputReader needs to implement ReadCloser and one more "sendChunk(Chunk)"
-// method. The main() loop above with read a chunk from the source returned by
-// selectSource() and then pass it to outputReader.sendChunk()
-type outputReader struct {
-	queue      chan *av.Packet
-	info       av.Info
-	closed     bool
-	closeError error
-}
-
-func newOutputReader(app string, room string) *outputReader {
-	return &outputReader{
-		queue: make(chan *av.Packet, 500),
-		info: av.Info{
-			Key:   fmt.Sprintf("%s/%s", app, room),
-			Inter: true,
-		},
-		closed:     false,
-		closeError: nil,
-	}
-}
-
-// sendChunk cleans metadata and returns both the new timestamp and the chunk
-// duration.
-func (o *outputReader) sendChunk(c *chunk, streamTimestamp uint32) (uint32, uint32) {
-	p := c.startPacket
-	var duration uint32 = 0
-	for {
-		if p == nil {
-			return streamTimestamp + duration, duration
-		}
-
-		offset := p.p.TimeStamp - c.startTimestamp
-		if offset > duration {
-			duration = offset
-		}
-		// As we send the chunk we need to detect and rewrite metadata packets
-		// so they contain correct stream values instead of file values
-		// https://helpx.adobe.com/adobe-media-server/dev/adding-metadata-live-stream.html
-
-		// check video metadata and update highestCompositionTime using
-		// VideoPacketHeader.CompositionTime() cast to uint32
-		packetCopy := &av.Packet{}
-		// Double copying isn't great, but we don't want to modify the timestamp
-		// ini the original source. It would break static slate assets in memory.
-		dupePacket(*p.p, packetCopy, streamTimestamp+offset)
-		if packetCopy.IsMetadata {
-			videoHdr, ok := packetCopy.Header.(av.VideoPacketHeader)
-			if ok {
-				ct := videoHdr.CompositionTime()
-				log.Infof("got header with composition time: %d", ct)
-			}
-		}
-		o.queue <- packetCopy
-		next := p.next
-		p = next
-	}
-}
-
-func (o *outputReader) Read(p *av.Packet) error {
-	packetOut := <-o.queue
-	dupePacket(*packetOut, p, 0)
-	return nil
-}
-
-func (o *outputReader) Alive() bool {
-	return !o.closed
-}
-
-func (o *outputReader) Info() av.Info {
-	return o.info
-}
-
-func (o *outputReader) Close(err error) {
-	o.closeError = err
-	o.closed = true
-}
-
-func dupePacket(in av.Packet, out *av.Packet, timeStamp uint32) {
-	out.IsVideo = in.IsVideo
-	out.IsAudio = in.IsAudio
-	out.IsMetadata = in.IsMetadata
-	out.StreamID = in.StreamID
-	out.TimeStamp = in.TimeStamp
-	out.Header = in.Header
-	out.Data = in.Data
-	if timeStamp > 0 {
-		out.TimeStamp = timeStamp
-	}
-}
