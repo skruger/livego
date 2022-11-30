@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"github.com/gwuhaolin/livego/av"
 	"github.com/gwuhaolin/livego/channel"
@@ -47,10 +48,29 @@ func startRtmp(stream *rtmp.RtmpStream, hlsServer *hls.Server, app configure.App
 	if app.RtmpAddr != "" {
 		rtmpAddr = app.RtmpAddr
 	}
+	isRtmps := configure.Config.GetBool("enable_rtmps")
 
-	rtmpListen, err := net.Listen("tcp", rtmpAddr)
-	if err != nil {
-		log.Fatal(err)
+	var rtmpListen net.Listener
+	if isRtmps {
+		certPath := configure.Config.GetString("rtmps_cert")
+		keyPath := configure.Config.GetString("rtmps_key")
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		rtmpListen, err = tls.Listen("tcp", rtmpAddr, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		var err error
+		rtmpListen, err = net.Listen("tcp", rtmpAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	var rtmpServer *rtmp.Server
@@ -68,7 +88,11 @@ func startRtmp(stream *rtmp.RtmpStream, hlsServer *hls.Server, app configure.App
 			log.Error("RTMP server panic: ", r)
 		}
 	}()
-	log.Info("RTMP Listen On ", rtmpAddr)
+	if isRtmps {
+		log.Info("RTMPS Listen On ", rtmpAddr)
+	} else {
+		log.Info("RTMP Listen On ", rtmpAddr)
+	}
 	rtmpServer.Serve(rtmpListen)
 }
 
